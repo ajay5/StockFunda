@@ -1,0 +1,11 @@
+streamlit>=1.39
+pandas>=2.2
+numpy>=1.26
+yfinance>=0.2.54
+plotly>=5.24
+scikit-learn>=1.5
+feedparser>=6.0
+vaderSentiment>=3.3
+python-dotenv>=1.0
+requests>=2.32
+pytest>=8.3
