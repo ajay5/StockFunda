@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import io
 import re
 from datetime import datetime, time, timedelta, timezone
 from typing import Any, Iterable
@@ -15,6 +16,129 @@ import requests
 
 IST = timezone(timedelta(hours=5, minutes=30))
 UTC = timezone.utc
+
+
+def fetch_nse_equity_catalog() -> tuple[list[dict[str, str]], str]:
+    """Fetch NSE EQ listings and attach live industry sectors where classified."""
+    url = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
+    industry_url = "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; BharatMarketResearch/1.0)",
+        "Accept": "text/csv,application/csv,*/*",
+    }
+    try:
+        response = requests.get(url, headers=headers, timeout=(4, 15))
+        response.raise_for_status()
+        industry_response = requests.get(industry_url, headers=headers, timeout=(4, 15))
+        industry_response.raise_for_status()
+    except requests.Timeout:
+        return [], "NSE equity or sector catalog request timed out"
+    except requests.RequestException as exc:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        return [], f"NSE equity or sector catalog request failed{f' (HTTP {status})' if status else ''}"
+
+    try:
+        frame = pd.read_csv(io.BytesIO(response.content), dtype=str)
+        industry_frame = pd.read_csv(io.BytesIO(industry_response.content), dtype=str)
+    except (ValueError, pd.errors.ParserError):
+        return [], "NSE equity catalog response was not valid CSV"
+    columns = {str(column).strip().upper(): column for column in frame.columns}
+    symbol_column = columns.get("SYMBOL")
+    name_column = columns.get("NAME OF COMPANY")
+    series_column = columns.get("SERIES")
+    if not symbol_column or not name_column or not series_column:
+        return [], "NSE equity catalog is missing required columns"
+
+    industry_columns = {str(column).strip().upper(): column for column in industry_frame.columns}
+    industry_symbol_column = industry_columns.get("SYMBOL")
+    industry_name_column = industry_columns.get("INDUSTRY")
+    if not industry_symbol_column or not industry_name_column:
+        return [], "NSE sector catalog is missing required columns"
+    industries = {
+        str(row[industry_symbol_column]).strip().upper(): str(row[industry_name_column]).strip()
+        for _, row in industry_frame.iterrows()
+        if pd.notna(row[industry_symbol_column]) and pd.notna(row[industry_name_column])
+    }
+
+    equities: list[dict[str, str]] = []
+    for _, row in frame.iterrows():
+        symbol = str(row.get(symbol_column) or "").strip().upper()
+        name = str(row.get(name_column) or "").strip()
+        series = str(row.get(series_column) or "").strip().upper()
+        if symbol and name and series == "EQ":
+            industry = industries.get(symbol, "Outside NIFTY 500 / industry unavailable")
+            equities.append(
+                {
+                    "symbol": f"{symbol}.NS",
+                    "nse_symbol": symbol,
+                    "name": name,
+                    "series": series,
+                    "industry": industry,
+                }
+            )
+    equities.sort(key=lambda item: (item["name"].casefold(), item["nse_symbol"]))
+    classified = sum(item["industry"] != "Outside NIFTY 500 / industry unavailable" for item in equities)
+    return equities, f"OK; loaded {len(equities)} NSE EQ securities, {classified} with NIFTY 500 industry classifications"
+
+
+def fetch_nse_commodity_etf_catalog() -> tuple[list[dict[str, str]], str]:
+    """Fetch currently listed NSE ETFs whose underlying asset is a commodity."""
+    url = "https://www.nseindia.com/api/etf"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://www.nseindia.com/market-data/exchange-traded-funds-etf",
+    }
+    try:
+        response = requests.get(url, headers=headers, timeout=(4, 15))
+    except requests.Timeout:
+        return [], "NSE commodity ETF catalog request timed out"
+    except requests.RequestException:
+        return [], "NSE commodity ETF catalog network request failed"
+    if response.status_code >= 400:
+        return [], f"NSE commodity ETF catalog HTTP {response.status_code}"
+    try:
+        payload = response.json()
+    except ValueError:
+        return [], "NSE commodity ETF catalog response was not valid JSON"
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+        return [], "NSE commodity ETF catalog has an unexpected response format"
+
+    # Map underlying asset descriptions (not individual fund symbols) to benchmarks.
+    commodity_benchmarks = {
+        "gold": ("Gold", "GC=F"),
+        "silver": ("Silver", "SI=F"),
+        "crude oil": ("Crude Oil", "CL=F"),
+        "natural gas": ("Natural Gas", "NG=F"),
+        "copper": ("Copper", "HG=F"),
+    }
+    funds: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for entry in payload["data"]:
+        if not isinstance(entry, dict):
+            continue
+        symbol = str(entry.get("symbol") or "").strip().upper()
+        asset = " ".join(str(entry.get("assets") or "").casefold().split())
+        match = next(
+            ((category, ticker) for commodity, (category, ticker) in commodity_benchmarks.items() if commodity in asset),
+            None,
+        )
+        if not symbol or not match or symbol in seen:
+            continue
+        category, benchmark = match
+        seen.add(symbol)
+        funds.append(
+            {
+                "symbol": f"{symbol}.NS",
+                "nse_symbol": symbol,
+                "name": f"{symbol} — {entry.get('assets') or 'Commodity'}",
+                "asset": str(entry.get("assets") or "Commodity"),
+                "category": category,
+                "benchmark": benchmark,
+            }
+        )
+    funds.sort(key=lambda item: (item["asset"].casefold(), item["nse_symbol"]))
+    return funds, f"OK; loaded {len(funds)} NSE commodity ETFs from the live ETF catalog"
 
 
 def _request_json(url: str, params: dict[str, Any]) -> tuple[Any, str]:

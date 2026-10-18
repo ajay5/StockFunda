@@ -4,7 +4,7 @@ import numpy as np,pandas as pd,streamlit as st,plotly.graph_objects as go,yfina
 import requests
 from dotenv import load_dotenv
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-from market_data import fetch_alphavantage_daily,fetch_bluesky_posts,fetch_finnhub_general_news,fetch_finnhub_news,fetch_gdelt_news,fetch_marketaux_news,fetch_nse_announcements_rss,fetch_nse_company_announcements,fetch_reddit_posts,normalize_yahoo_news,point_in_time_news_feature
+from market_data import fetch_alphavantage_daily,fetch_bluesky_posts,fetch_finnhub_general_news,fetch_finnhub_news,fetch_gdelt_news,fetch_marketaux_news,fetch_nse_announcements_rss,fetch_nse_commodity_etf_catalog,fetch_nse_company_announcements,fetch_nse_equity_catalog,fetch_reddit_posts,normalize_yahoo_news,point_in_time_news_feature
 from sklearn.ensemble import RandomForestRegressor,RandomForestClassifier,HistGradientBoostingRegressor
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import balanced_accuracy_score,mean_absolute_error,precision_score,brier_score_loss
@@ -13,25 +13,6 @@ from sklearn.model_selection import TimeSeriesSplit
 load_dotenv()
 st.set_page_config(page_title='Bharat Market AI Production',page_icon='📈',layout='wide')
 DB=os.getenv('APP_DB_PATH','stock_ai.db'); AN=SentimentIntensityAnalyzer()
-SECTORS={
-'Information Technology':{'TCS':'TCS','Infosys':'INFY','HCL Tech':'HCLTECH','Wipro':'WIPRO'},
-'Banking':{'HDFC Bank':'HDFCBANK','ICICI Bank':'ICICIBANK','SBI':'SBIN','Axis Bank':'AXISBANK'},
-'FMCG':{'ITC':'ITC','HUL':'HINDUNILVR','Nestle India':'NESTLEIND'},
-'Pharma':{'Sun Pharma':'SUNPHARMA','Cipla':'CIPLA','Dr Reddy':'DRREDDY'},
-'Automobile':{'Tata Motors':'TATAMOTORS','Maruti':'MARUTI','M&M':'M&M'},
-'Oil & Gas':{'Reliance':'RELIANCE','ONGC':'ONGC','IOC':'IOC'},
-'Power':{'NTPC':'NTPC','Power Grid':'POWERGRID','Tata Power':'TATAPOWER'},
-'Metals':{'Tata Steel':'TATASTEEL','Hindalco':'HINDALCO','JSW Steel':'JSWSTEEL'},
-'Telecom':{'Bharti Airtel':'BHARTIARTL','Vodafone Idea':'IDEA'},
-'Defense':{'HAL':'HAL','Bharat Electronics':'BEL'},
-'Railway':{'IRCTC':'IRCTC','RVNL':'RVNL'},'Realty':{'DLF':'DLF','Godrej Properties':'GODREJPROP'},
-'Financial Services':{'Bajaj Finance':'BAJFINANCE','Bajaj Finserv':'BAJAJFINSV'},
-'Infrastructure':{'Larsen & Toubro':'LT','Adani Ports':'ADANIPORTS'}}
-# Indian-listed commodity ETFs provide INR-denominated tradable price proxies.
-# Their Yahoo Finance history was checked; these are not MCX futures contracts.
-COMMODITIES={
- 'Gold ETF (Nippon India ETF Gold BeES)':{'symbol':'GOLDBEES.NS','name':'Gold','benchmark':'GC=F'},
- 'Silver ETF (Nippon India ETF Silver BeES)':{'symbol':'SILVERBEES.NS','name':'Silver','benchmark':'SI=F'}}
 H={'1 Day':1,'3 Days':3,'7 Days':7,'15 Days':15,'30 Days':30,'3 Months':63,'1 Year':252}
 
 def conn():
@@ -41,6 +22,12 @@ def init():
  CREATE TABLE IF NOT EXISTS predictions(id INTEGER PRIMARY KEY,symbol TEXT,prediction_date TEXT,target_date TEXT,horizon INTEGER,latest_close REAL,predicted_close REAL,predicted_return REAL,signal TEXT,confidence REAL,bullish REAL,bearish REAL,low REAL,high REAL,market_condition TEXT,market_return REAL,sector_return REAL,news_score REAL,news_json TEXT,feature_json TEXT,model_version TEXT,actual_close REAL,actual_return REAL,percentage_error REAL,direction_correct INTEGER,evaluated_at TEXT,UNIQUE(symbol,prediction_date,horizon,model_version));
  CREATE TABLE IF NOT EXISTS model_registry(id INTEGER PRIMARY KEY,symbol TEXT,horizon INTEGER,version TEXT,trained_at TEXT,rows INTEGER,metrics_json TEXT,active INTEGER);''');c.commit();c.close()
 init()
+@st.cache_data(ttl=6*3600,show_spinner=False)
+def nse_equity_sector_catalog_cached():
+ return fetch_nse_equity_catalog()
+@st.cache_data(ttl=6*3600,show_spinner=False)
+def nse_commodity_etf_catalog_cached():
+ return fetch_nse_commodity_etf_catalog()
 @st.cache_data(ttl=300,show_spinner=False)
 def hist(ticker,period='5y'):
  d=yf.download(ticker,period=period,auto_adjust=True,progress=False,threads=False)
@@ -115,12 +102,6 @@ def news(company,symbol,alpha_key,marketaux_token,finnhub_key,reddit_id,reddit_s
   item['score']=float(np.clip(score,-1,1));articles.append(item)
   c.execute('INSERT OR IGNORE INTO news_history(symbol,captured_at,published_at,source,headline,url,sentiment,relevance) VALUES(?,?,?,?,?,?,?,?)',(symbol,now,item.get('published',''),item.get('source','Financial News'),title,item.get('url',''),item['score'],float(item.get('relevance',1))))
  c.commit();c.close();return articles,provider_status
-def sector_proxy(sec,suffix,period):
- frames=[]
- for t in SECTORS[sec].values():
-  try:frames.append(hist(t+suffix,period).Close.rename(t))
-  except:pass
- p=pd.concat(frames,axis=1).ffill();return (p/p.iloc[0]).mean(axis=1).rename('Close').to_frame()
 def reconcile(symbol,d):
  closes={i.date().isoformat():float(v) for i,v in d.Close.items()};dates=sorted(closes);c=conn();rows=c.execute('SELECT * FROM predictions WHERE symbol=? AND actual_close IS NULL',(symbol,)).fetchall()
  for r in rows:
@@ -129,7 +110,7 @@ def reconcile(symbol,d):
   td=future[r['horizon']-1];actual=closes[td];ar=actual/r['latest_close']-1;pdirection=np.sign(r['predicted_return']);adirection=np.sign(ar)
   c.execute('UPDATE predictions SET target_date=?,actual_close=?,actual_return=?,percentage_error=?,direction_correct=?,evaluated_at=? WHERE id=?',(td,actual,ar,abs(actual-r['predicted_close'])/actual*100,int(pdirection==adirection),datetime.now(timezone.utc).isoformat(),r['id']))
  c.commit();c.close()
-def model(stock,market,sector,symbol,horizon,cost):
+def model(stock,market,sector,symbol,horizon,cost,return_only=False):
  x=stock.copy();m=market.Close.reindex(x.index).ffill();s=sector.Close.reindex(x.index).ffill();x['MKT']=m.pct_change();x['SEC']=s.pct_change();x['RELM']=x.RET-x.MKT;x['RELS']=x.RET-x.SEC
  x['RET5']=x.Close.pct_change(5);x['RET20']=x.Close.pct_change(20);x['MKT5']=m.pct_change(5);x['MKT20']=m.pct_change(20);x['MKT_VOL20']=x.MKT.rolling(20).std()*np.sqrt(252);x['SEC5']=s.pct_change(5);x['SEC20']=s.pct_change(20);x['SEC_VOL20']=x.SEC.rolling(20).std()*np.sqrt(252)
  c=conn();rows=[dict(r) for r in c.execute('SELECT published_at,sentiment,relevance,source FROM news_history WHERE symbol=? AND published_at IS NOT NULL',(symbol,)).fetchall()];c.close()
@@ -148,7 +129,13 @@ def model(stock,market,sector,symbol,horizon,cost):
  x['Y']=x.Close.shift(-horizon)/x.Close-1;band=np.maximum(.004,x.RET.rolling(60).std()*np.sqrt(horizon)*.35);x['C']=np.select([x.Y>band,x.Y<-band],[2,0],default=1)
  F=['RSI','EMA20','EMA50','EMA200','MACD','MACDS','RET','RET5','RET20','VOL','VOLZ','ATR','MKT','MKT5','MKT20','MKT_VOL20','SEC','SEC5','SEC20','SEC_VOL20','RELM','RELS','ANNOUNCEMENTS_365D','NEWS_SENTIMENT_90D','SOCIAL_SENTIMENT_30D'];z=x[F+['Y','C']].replace([np.inf,-np.inf],np.nan).dropna().iloc[:-horizon]
  if len(z)<260:raise ValueError('Choose 5y or 10y history; insufficient valid rows.')
- X,yr,yc=z[F],z.Y,z.C.astype(int);cv=TimeSeriesSplit(n_splits=5,gap=horizon);op=np.full(len(z),np.nan);oq=np.full((len(z),3),np.nan)
+ X,yr,yc=z[F],z.Y,z.C.astype(int)
+ if return_only:
+  r1=RandomForestRegressor(n_estimators=400,max_depth=8,min_samples_leaf=5,n_jobs=-1,random_state=42).fit(X,yr)
+  r2=HistGradientBoostingRegressor(max_iter=220,max_depth=5,random_state=42).fit(X,yr)
+  latest=x[F].dropna().iloc[[-1]].copy();pr=float((r1.predict(latest)[0]+r2.predict(latest)[0])/2);close=float(stock.Close.iloc[-1])
+  return {'return':pr,'price':close*(1+pr),'close':close}
+ cv=TimeSeriesSplit(n_splits=5,gap=horizon);op=np.full(len(z),np.nan);oq=np.full((len(z),3),np.nan)
  for tr,te in cv.split(X):
   r1=RandomForestRegressor(n_estimators=250,max_depth=8,min_samples_leaf=5,n_jobs=-1,random_state=42).fit(X.iloc[tr],yr.iloc[tr]);r2=HistGradientBoostingRegressor(max_iter=180,max_depth=5,random_state=42).fit(X.iloc[tr],yr.iloc[tr]);cl=RandomForestClassifier(n_estimators=300,max_depth=8,min_samples_leaf=5,class_weight='balanced',n_jobs=-1,random_state=42).fit(X.iloc[tr],yc.iloc[tr]);op[te]=(r1.predict(X.iloc[te])+r2.predict(X.iloc[te]))/2;q=cl.predict_proba(X.iloc[te]);
   for j,k in enumerate(cl.classes_):oq[te,int(k)]=q[:,j]
@@ -160,22 +147,53 @@ def model(stock,market,sector,symbol,horizon,cost):
  pp=cal.predict_proba(raw)[0];res=act-pred;lo,hi=np.quantile(res,[.1,.9]);close=float(stock.Close.iloc[-1]);version=f'{symbol}-h{horizon}-{stock.index[-1].date()}'
  return {'return':pr,'price':close*(1+pr),'low':close*(1+pr+lo),'high':close*(1+pr+hi),'signal':['SELL','HOLD','BUY'][pp.argmax()],'confidence':pp.max()*100,'bull':pp[2]*100,'bear':pp[0]*100,'metrics':metrics,'version':version,'features':latest.iloc[0].to_dict()}
 
+@st.cache_data(ttl=900,show_spinner=False)
+def commodity_price_forecast_cached(symbol,benchmark,period,horizon,db_path):
+ stock=indicators(hist(symbol,period));market=hist(benchmark,period);currency=hist('USDINR=X',period)
+ return model(stock,market,currency,symbol,horizon,0,return_only=True)
+
 st.title('📈 Bharat Market AI Production Research Platform');st.error('No model can guarantee returns. Use this only for research and paper trading, not as investment advice.')
+equity_catalog,equity_catalog_status=nse_equity_sector_catalog_cached()
+commodity_catalog,commodity_catalog_status=nse_commodity_etf_catalog_cached()
+equity_options={f"{item['nse_symbol']} — {item['name']}":item for item in equity_catalog}
+commodity_options={f"{item['nse_symbol']} — {item['asset']}":item for item in commodity_catalog}
+industry_options=sorted({item['industry'] for item in equity_catalog})
+commodity_categories=sorted({item['category'] for item in commodity_catalog})
 with st.sidebar:
- market_type=st.selectbox('Market type',['Stocks','Indian commodity ETFs'])
- is_commodity=market_type=='Indian commodity ETFs'
+ if st.button('Refresh online NSE lists'):
+  nse_equity_sector_catalog_cached.clear();nse_commodity_etf_catalog_cached.clear();st.rerun()
+ st.caption(f"Online NSE list: {len(equity_options):,} EQ stocks · {len(commodity_options):,} commodity ETFs")
+ market_types=['NSE stocks']+(['NSE commodity ETFs'] if commodity_options else [])
+ market_type=st.selectbox('Instrument type',market_types)
+ is_commodity=market_type=='NSE commodity ETFs'
  if is_commodity:
-  commodity_name=st.selectbox('Commodity',list(COMMODITIES))
-  instrument=COMMODITIES[commodity_name];company=instrument['name'];symbol=instrument['symbol'];sec='Commodity'
+  commodity_category=st.selectbox('Commodity',commodity_categories)
+  category_funds=[item for item in commodity_catalog if item['category']==commodity_category]
+  category_options={f"{item['nse_symbol']} — {item['asset']}":item for item in category_funds}
+  commodity_label=st.selectbox('Commodity ETF',list(category_options))
+  instrument=category_options[commodity_label];company=instrument['asset'];symbol=instrument['symbol']
  else:
-  exchange=st.selectbox('Exchange',['NSE','BSE']);suffix='.NS' if exchange=='NSE' else '.BO';sec=st.selectbox('Sector',list(SECTORS));company=st.selectbox('Company',list(SECTORS[sec]));symbol=SECTORS[sec][company]+suffix
+  if equity_options:
+   sector_options=['All sectors']+industry_options
+   selected_sector=st.selectbox('Sector',sector_options)
+   sector_equities=equity_catalog if selected_sector=='All sectors' else [item for item in equity_catalog if item['industry']==selected_sector]
+   stock_options={f"{item['nse_symbol']} — {item['name']}":item for item in sector_equities}
+   stock_labels=list(stock_options)
+   stock_label=st.selectbox('NSE-listed stock',stock_labels,index=0)
+   instrument=stock_options[stock_label];company=instrument['name'];symbol=instrument['symbol']
  hn=st.selectbox('Forecast horizon',list(H),index=0);horizon=H[hn];period=st.selectbox('Price history for model',['5y','10y'],index=0);cost=st.number_input('Round-trip cost (bps)',0,200,20,5);run=st.button('Train, evaluate & predict',type='primary',use_container_width=True)
+if not commodity_options and not equity_options:
+ st.error(f"Could not load NSE instruments online. Stocks: {equity_catalog_status}. Commodity ETFs: {commodity_catalog_status}. Use Refresh online NSE lists to retry.")
+ st.stop()
+if not is_commodity and not equity_options:
+ st.error(f"NSE stock list is unavailable: {equity_catalog_status}. Choose commodity ETFs or retry the online list refresh.")
+ st.stop()
 try:
  raw=hist(symbol,period);stock=indicators(raw)
  if is_commodity:
   market=hist(instrument['benchmark'],period);sector=hist('USDINR=X',period)
  else:
-  market=hist('^NSEI',period);sector=sector_proxy(sec,suffix,period)
+  market=hist('^NSEI',period);sector=market.copy()
  reddit_id=os.getenv('REDDIT_CLIENT_ID','');reddit_secret=os.getenv('REDDIT_CLIENT_SECRET','');reddit_agent=os.getenv('REDDIT_USER_AGENT','indian-stock-ai/1.0');alpha_key=os.getenv('ALPHAVANTAGE_API_KEY','');marketaux_token=os.getenv('MARKETAUX_API_TOKEN','');finnhub_key=os.getenv('FINNHUB_API_KEY','');articles,provider_status=news(company,symbol,alpha_key,marketaux_token,finnhub_key,reddit_id,reddit_secret,reddit_agent,is_commodity);reconcile(symbol,raw);nscore=np.average([a['score'] for a in articles],weights=[a.get('relevance',1) for a in articles]) if articles else 0;mret=market.Close.pct_change().iloc[-1];sret=sector.Close.pct_change().iloc[-1];condition='Bullish' if mret>.003 else 'Bearish' if mret<-.003 else 'Neutral'
 except Exception as e:st.error(str(e));st.stop()
 tabs=st.tabs(['Prediction','Accuracy & Learning','News','Technical','Data Center','Operations'])
@@ -183,6 +201,7 @@ with tabs[0]:
  if is_commodity:
   st.info(f"Commodity proxy: {company} is an NSE-listed ETF. The target is its next-day INR per-unit closing price, using {instrument['benchmark']} and USD/INR as context; this is not an MCX futures quote.")
  fig=go.Figure([go.Candlestick(x=stock.index,open=stock.Open,high=stock.High,low=stock.Low,close=stock.Close),go.Scatter(x=stock.index,y=stock.EMA20,name='EMA20'),go.Scatter(x=stock.index,y=stock.EMA50,name='EMA50')]);fig.update_layout(height=430,xaxis_rangeslider_visible=False);st.plotly_chart(fig,use_container_width=True)
+ r=None
  if run:
   try:
    r=model(stock,market,sector,symbol,horizon,cost);close=float(stock.Close.iloc[-1]);cols=st.columns(7);vals=[('Signal',r['signal']),('Confidence',f"{r['confidence']:.1f}%"),('Latest',f'₹{close:,.2f}'),('Forecast',f"₹{r['price']:,.2f}"),('Return',f"{r['return']*100:+.2f}%"),('Bullish',f"{r['bull']:.1f}%"),('Bearish',f"{r['bear']:.1f}%")]
@@ -194,6 +213,28 @@ with tabs[0]:
    for c,(k,v) in zip(mc,ev):c.metric(k,f'{v:.2f}%')
    if M['balanced_accuracy']<=M['baseline_accuracy'] or M['mae']>=M['naive_mae'] or M['cost_return']<=0:st.warning('Production gate failed. Do not use this signal.')
   except Exception as e:st.error(str(e))
+ if is_commodity:
+  st.subheader(f'{commodity_category} ETF comparison — {hn} forecast')
+  st.caption('Sorted by model-predicted return over the selected horizon, highest first. Prices are INR per ETF unit; forecasts are not guarantees of returns.')
+  comparison_rows=[];unavailable=[]
+  with st.spinner(f'Preparing cached next-day forecasts for {len(category_funds)} {commodity_category} ETFs...'):
+   for fund in category_funds:
+    try:
+     if run and fund['symbol']==symbol and r is not None:
+      forecast={'close':close,'price':r['price'],'return':r['return']}
+     else:
+      forecast=commodity_price_forecast_cached(fund['symbol'],fund['benchmark'],period,horizon,DB)
+     comparison_rows.append({'Symbol':fund['nse_symbol'],'ETF / Asset':fund['name'],'Last price (₹)':forecast['close'],'Predicted price (₹)':forecast['price'],'Predicted return (%)':forecast['return']*100})
+    except Exception as exc:
+     unavailable.append(f"{fund['nse_symbol']}: {type(exc).__name__}")
+  if comparison_rows:
+   comparison=pd.DataFrame(comparison_rows).sort_values('Predicted return (%)',ascending=False,kind='stable')
+   st.dataframe(comparison,use_container_width=True,hide_index=True)
+  else:
+   st.warning(f'Could not generate a forecast for the {commodity_category} ETFs from available price history.')
+  if unavailable:
+   with st.expander(f'{len(unavailable)} ETF forecasts unavailable'):
+    st.write('\n'.join(unavailable))
 with tabs[1]:
  c=conn();rows=[dict(x) for x in c.execute('SELECT * FROM predictions WHERE symbol=? ORDER BY prediction_date DESC',(symbol,)).fetchall()];c.close()
  if rows:

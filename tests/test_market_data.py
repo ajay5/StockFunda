@@ -13,7 +13,9 @@ from market_data import (
     fetch_gdelt_news,
     fetch_marketaux_news,
     fetch_nse_announcements_rss,
+    fetch_nse_commodity_etf_catalog,
     fetch_nse_company_announcements,
+    fetch_nse_equity_catalog,
     fetch_reddit_posts,
     normalize_yahoo_news,
     point_in_time_news_feature,
@@ -96,6 +98,59 @@ class FakeResponse:
 
     def json(self):
         return self.payload
+
+
+def test_nse_equity_catalog_loads_only_eq_series(monkeypatch):
+    csv_payload = (
+        "SYMBOL,NAME OF COMPANY, SERIES\n"
+        "TCS,Tata Consultancy Services Limited,EQ\n"
+        "NEWCO,New NSE Listing,EQ\n"
+        "TESTBE,Test SME Limited,BE\n"
+    ).encode()
+    industry_payload = b"Company Name,Industry,Symbol,Series,ISIN Code\nTCS,TCS Industry,TCS,EQ,INE123\n"
+
+    def fake_get(url, **kwargs):
+        return FakeResponse(industry_payload if "ind_nifty500list.csv" in url else csv_payload)
+
+    monkeypatch.setattr(
+        "market_data.requests.get",
+        fake_get,
+    )
+
+    equities, status = fetch_nse_equity_catalog()
+
+    by_symbol = {item["nse_symbol"]: item for item in equities}
+    assert set(by_symbol) == {"TCS", "NEWCO"}
+    assert by_symbol["TCS"]["industry"] == "TCS Industry"
+    assert by_symbol["NEWCO"]["industry"] == "Outside NIFTY 500 / industry unavailable"
+    assert "2 NSE EQ securities" in status
+    assert "1 with NIFTY 500 industry classifications" in status
+
+
+def test_nse_commodity_etf_catalog_is_online_and_maps_underlying(monkeypatch):
+    monkeypatch.setattr(
+        "market_data.requests.get",
+        lambda *args, **kwargs: FakeResponse(
+            {
+                "data": [
+                    {"symbol": "GOLDBEES", "assets": "Gold"},
+                    {"symbol": "SILVERBEES", "assets": "Domestic price of Silver"},
+                    {"symbol": "METALIETF", "assets": "Nifty Metal Index"},
+                ]
+            }
+        ),
+    )
+
+    funds, status = fetch_nse_commodity_etf_catalog()
+
+    by_symbol = {fund["nse_symbol"]: fund for fund in funds}
+    assert set(by_symbol) == {"GOLDBEES", "SILVERBEES"}
+    assert by_symbol["GOLDBEES"]["symbol"] == "GOLDBEES.NS"
+    assert by_symbol["GOLDBEES"]["benchmark"] == "GC=F"
+    assert by_symbol["GOLDBEES"]["category"] == "Gold"
+    assert by_symbol["SILVERBEES"]["benchmark"] == "SI=F"
+    assert by_symbol["SILVERBEES"]["category"] == "Silver"
+    assert "2 NSE commodity ETFs" in status
 
 
 def test_gdelt_adapter_normalizes_recent_articles(monkeypatch):
