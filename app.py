@@ -27,6 +27,11 @@ SECTORS={
 'Railway':{'IRCTC':'IRCTC','RVNL':'RVNL'},'Realty':{'DLF':'DLF','Godrej Properties':'GODREJPROP'},
 'Financial Services':{'Bajaj Finance':'BAJFINANCE','Bajaj Finserv':'BAJAJFINSV'},
 'Infrastructure':{'Larsen & Toubro':'LT','Adani Ports':'ADANIPORTS'}}
+# Indian-listed commodity ETFs provide INR-denominated tradable price proxies.
+# Their Yahoo Finance history was checked; these are not MCX futures contracts.
+COMMODITIES={
+ 'Gold ETF (Nippon India ETF Gold BeES)':{'symbol':'GOLDBEES.NS','name':'Gold','benchmark':'GC=F'},
+ 'Silver ETF (Nippon India ETF Silver BeES)':{'symbol':'SILVERBEES.NS','name':'Silver','benchmark':'SI=F'}}
 H={'1 Day':1,'3 Days':3,'7 Days':7,'15 Days':15,'30 Days':30,'3 Months':63,'1 Year':252}
 
 def conn():
@@ -55,7 +60,7 @@ def reddit_access_token(client_id,client_secret,user_agent):
   response=requests.post('https://www.reddit.com/api/v1/access_token',auth=(client_id,client_secret),data={'grant_type':'client_credentials'},headers={'User-Agent':user_agent},timeout=(3,8));response.raise_for_status();return str(response.json().get('access_token') or '')
  except (requests.RequestException,ValueError):return ''
 @st.cache_data(ttl=300,show_spinner=False)
-def news(company,symbol,alpha_key,marketaux_token,finnhub_key,reddit_id,reddit_secret,reddit_agent):
+def news(company,symbol,alpha_key,marketaux_token,finnhub_key,reddit_id,reddit_secret,reddit_agent,is_commodity=False):
  out=[];provider_status=[]
  def collect_api(name,key,environment_name,fetch):
   checked_at=datetime.now(timezone.utc).isoformat()
@@ -72,14 +77,16 @@ def news(company,symbol,alpha_key,marketaux_token,finnhub_key,reddit_id,reddit_s
  except Exception:
   pass
  provider_status.append({'Provider':'Alpha Vantage NEWS_SENTIMENT','Configured':'Yes' if alpha_key else 'No','Called':'No','Articles':0,'Status':'Not available on free plan' if alpha_key else 'Not configured','Details':'Alpha Vantage marks NEWS_SENTIMENT as premium; skipped to avoid a guaranteed premium-plan error.' if alpha_key else 'Set ALPHAVANTAGE_API_KEY in .env if you later enable a plan with NEWS_SENTIMENT access.','Checked UTC':datetime.now(timezone.utc).isoformat()})
- nse_end=datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=5,minutes=30))).date()
- nse_start=nse_end-timedelta(days=365)
- collect_api('NSE India official announcements RSS','public','NSE official RSS',lambda:fetch_nse_announcements_rss(symbol,company,30))
- collect_api('NSE India company announcement archive','public','NSE official announcements',lambda:fetch_nse_company_announcements(symbol,nse_start,nse_end,limit=500))
+ if not is_commodity:
+  nse_end=datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=5,minutes=30))).date()
+  nse_start=nse_end-timedelta(days=365)
+  collect_api('NSE India official announcements RSS','public','NSE official RSS',lambda:fetch_nse_announcements_rss(symbol,company,30))
+  collect_api('NSE India company announcement archive','public','NSE official announcements',lambda:fetch_nse_company_announcements(symbol,nse_start,nse_end,limit=500))
  collect_api('Marketaux',marketaux_token,'MARKETAUX_API_TOKEN',lambda:fetch_marketaux_news(marketaux_token,symbol,20))
  collect_api('Finnhub company news (free tier)',finnhub_key,'FINNHUB_API_KEY',lambda:fetch_finnhub_news(finnhub_key,symbol,20))
  collect_api('Finnhub general market news (free)',finnhub_key,'FINNHUB_API_KEY',lambda:fetch_finnhub_general_news(finnhub_key,20))
- url='https://news.google.com/rss/search?q='+urllib.parse.quote(company+' stock India')+'&hl=en-IN&gl=IN&ceid=IN:en'
+ query=f'{company} commodity India MCX price' if is_commodity else f'{company} stock India'
+ url='https://news.google.com/rss/search?q='+urllib.parse.quote(query)+'&hl=en-IN&gl=IN&ceid=IN:en'
  try:
   response=requests.get(url,timeout=(3,8));response.raise_for_status();feed=feedparser.parse(response.content)
   for e in feed.entries[:20]:
@@ -90,13 +97,13 @@ def news(company,symbol,alpha_key,marketaux_token,finnhub_key,reddit_id,reddit_s
  except Exception:
   pass
  bare_symbol=symbol.rsplit('.',1)[0]
- try:out.extend(fetch_gdelt_news(f'("{company}" OR "{bare_symbol}")',limit=20))
+ try:out.extend(fetch_gdelt_news(f'("{company}" OR "{bare_symbol}") AND (India OR MCX OR commodity)',limit=20) if is_commodity else fetch_gdelt_news(f'("{company}" OR "{bare_symbol}")',limit=20))
  except Exception:pass
- try:out.extend(fetch_bluesky_posts(f'{company} stock',limit=20))
+ try:out.extend(fetch_bluesky_posts(f'{company} commodity India MCX' if is_commodity else f'{company} stock',limit=20))
  except Exception:pass
  if reddit_id and reddit_secret:
   token=reddit_access_token(reddit_id,reddit_secret,reddit_agent)
-  try:out.extend(fetch_reddit_posts(f'"{company}" OR "{bare_symbol}"',token,reddit_agent,limit=20))
+  try:out.extend(fetch_reddit_posts(f'"{company}" commodity OR "{bare_symbol}"',token,reddit_agent,limit=20) if is_commodity else fetch_reddit_posts(f'"{company}" OR "{bare_symbol}"',token,reddit_agent,limit=20))
   except Exception:pass
  articles=[];seen=set();now=datetime.now(timezone.utc).isoformat();c=conn()
  for item in out:
@@ -155,12 +162,26 @@ def model(stock,market,sector,symbol,horizon,cost):
 
 st.title('📈 Bharat Market AI Production Research Platform');st.error('No model can guarantee returns. Use this only for research and paper trading, not as investment advice.')
 with st.sidebar:
-  exchange=st.selectbox('Exchange',['NSE','BSE']);suffix='.NS' if exchange=='NSE' else '.BO';sec=st.selectbox('Sector',list(SECTORS));company=st.selectbox('Company',list(SECTORS[sec]));symbol=SECTORS[sec][company]+suffix;hn=st.selectbox('Horizon',list(H));horizon=H[hn];period=st.selectbox('Price history for model',['5y','10y'],index=0);cost=st.number_input('Round-trip cost (bps)',0,200,20,5);run=st.button('Train, evaluate & predict',type='primary',use_container_width=True)
+ market_type=st.selectbox('Market type',['Stocks','Indian commodity ETFs'])
+ is_commodity=market_type=='Indian commodity ETFs'
+ if is_commodity:
+  commodity_name=st.selectbox('Commodity',list(COMMODITIES))
+  instrument=COMMODITIES[commodity_name];company=instrument['name'];symbol=instrument['symbol'];sec='Commodity'
+ else:
+  exchange=st.selectbox('Exchange',['NSE','BSE']);suffix='.NS' if exchange=='NSE' else '.BO';sec=st.selectbox('Sector',list(SECTORS));company=st.selectbox('Company',list(SECTORS[sec]));symbol=SECTORS[sec][company]+suffix
+ hn=st.selectbox('Forecast horizon',list(H),index=0);horizon=H[hn];period=st.selectbox('Price history for model',['5y','10y'],index=0);cost=st.number_input('Round-trip cost (bps)',0,200,20,5);run=st.button('Train, evaluate & predict',type='primary',use_container_width=True)
 try:
- raw=hist(symbol,period);stock=indicators(raw);market=hist('^NSEI',period);sector=sector_proxy(sec,suffix,period);reddit_id=os.getenv('REDDIT_CLIENT_ID','');reddit_secret=os.getenv('REDDIT_CLIENT_SECRET','');reddit_agent=os.getenv('REDDIT_USER_AGENT','indian-stock-ai/1.0');alpha_key=os.getenv('ALPHAVANTAGE_API_KEY','');marketaux_token=os.getenv('MARKETAUX_API_TOKEN','');finnhub_key=os.getenv('FINNHUB_API_KEY','');articles,provider_status=news(company,symbol,alpha_key,marketaux_token,finnhub_key,reddit_id,reddit_secret,reddit_agent);reconcile(symbol,raw);nscore=np.average([a['score'] for a in articles],weights=[a.get('relevance',1) for a in articles]) if articles else 0;mret=market.Close.pct_change().iloc[-1];sret=sector.Close.pct_change().iloc[-1];condition='Bullish' if mret>.003 else 'Bearish' if mret<-.003 else 'Neutral'
+ raw=hist(symbol,period);stock=indicators(raw)
+ if is_commodity:
+  market=hist(instrument['benchmark'],period);sector=hist('USDINR=X',period)
+ else:
+  market=hist('^NSEI',period);sector=sector_proxy(sec,suffix,period)
+ reddit_id=os.getenv('REDDIT_CLIENT_ID','');reddit_secret=os.getenv('REDDIT_CLIENT_SECRET','');reddit_agent=os.getenv('REDDIT_USER_AGENT','indian-stock-ai/1.0');alpha_key=os.getenv('ALPHAVANTAGE_API_KEY','');marketaux_token=os.getenv('MARKETAUX_API_TOKEN','');finnhub_key=os.getenv('FINNHUB_API_KEY','');articles,provider_status=news(company,symbol,alpha_key,marketaux_token,finnhub_key,reddit_id,reddit_secret,reddit_agent,is_commodity);reconcile(symbol,raw);nscore=np.average([a['score'] for a in articles],weights=[a.get('relevance',1) for a in articles]) if articles else 0;mret=market.Close.pct_change().iloc[-1];sret=sector.Close.pct_change().iloc[-1];condition='Bullish' if mret>.003 else 'Bearish' if mret<-.003 else 'Neutral'
 except Exception as e:st.error(str(e));st.stop()
 tabs=st.tabs(['Prediction','Accuracy & Learning','News','Technical','Data Center','Operations'])
 with tabs[0]:
+ if is_commodity:
+  st.info(f"Commodity proxy: {company} is an NSE-listed ETF. The target is its next-day INR per-unit closing price, using {instrument['benchmark']} and USD/INR as context; this is not an MCX futures quote.")
  fig=go.Figure([go.Candlestick(x=stock.index,open=stock.Open,high=stock.High,low=stock.Low,close=stock.Close),go.Scatter(x=stock.index,y=stock.EMA20,name='EMA20'),go.Scatter(x=stock.index,y=stock.EMA50,name='EMA50')]);fig.update_layout(height=430,xaxis_rangeslider_visible=False);st.plotly_chart(fig,use_container_width=True)
  if run:
   try:
@@ -181,7 +202,7 @@ with tabs[1]:
  else:st.info('Run predictions. The app evaluates each one after its target date becomes available.')
 with tabs[2]:
  if st.button('Refresh news providers now'):
-  load_dotenv(override=True);alpha_key=os.getenv('ALPHAVANTAGE_API_KEY','');marketaux_token=os.getenv('MARKETAUX_API_TOKEN','');finnhub_key=os.getenv('FINNHUB_API_KEY','');reddit_id=os.getenv('REDDIT_CLIENT_ID','');reddit_secret=os.getenv('REDDIT_CLIENT_SECRET','');reddit_agent=os.getenv('REDDIT_USER_AGENT','indian-stock-ai/1.0');news.clear();articles,provider_status=news(company,symbol,alpha_key,marketaux_token,finnhub_key,reddit_id,reddit_secret,reddit_agent);nscore=np.average([a['score'] for a in articles],weights=[a.get('relevance',1) for a in articles]) if articles else 0
+  load_dotenv(override=True);alpha_key=os.getenv('ALPHAVANTAGE_API_KEY','');marketaux_token=os.getenv('MARKETAUX_API_TOKEN','');finnhub_key=os.getenv('FINNHUB_API_KEY','');reddit_id=os.getenv('REDDIT_CLIENT_ID','');reddit_secret=os.getenv('REDDIT_CLIENT_SECRET','');reddit_agent=os.getenv('REDDIT_USER_AGENT','indian-stock-ai/1.0');news.clear();articles,provider_status=news(company,symbol,alpha_key,marketaux_token,finnhub_key,reddit_id,reddit_secret,reddit_agent,is_commodity);nscore=np.average([a['score'] for a in articles],weights=[a.get('relevance',1) for a in articles]) if articles else 0
  with st.expander('Alpha Vantage free daily price-data check'):
   load_dotenv();alpha_key=os.getenv('ALPHAVANTAGE_API_KEY','')
   suggested_av_symbol=symbol.rsplit('.',1)[0]+'.BSE'
@@ -209,11 +230,13 @@ with tabs[3]:
  for c,k in zip(cols,['RSI','MACD','MACDS','EMA20','EMA50','EMA200','ATR','VOL']):c.metric(k,f"{stock[k].iloc[-1]:.2f}")
 with tabs[4]:
  st.subheader('Backfill historical NSE company announcements')
+ if is_commodity:
+  st.info('NSE issuer-announcement backfill is for listed companies. Commodity instruments use commodity-focused news and sentiment instead.')
  today_ist=datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=5,minutes=30))).date()
  nse_range=st.date_input('NSE announcement date range',value=(today_ist-timedelta(days=365),today_ist),key='nse_announcement_range_12m')
  if len(nse_range)==2:
   nse_start,nse_end=nse_range
-  if st.button('Fetch historical NSE announcements'):
+  if st.button('Fetch historical NSE announcements',disabled=is_commodity):
    nse_rows,nse_detail=fetch_nse_company_announcements(symbol,nse_start,nse_end,limit=500)
    st.session_state['nse_history_result']={'symbol':symbol,'start':nse_start.isoformat(),'end':nse_end.isoformat(),'rows':nse_rows,'detail':nse_detail}
   nse_result=st.session_state.get('nse_history_result',{})
