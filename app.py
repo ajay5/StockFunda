@@ -12,7 +12,15 @@ from sklearn.model_selection import TimeSeriesSplit
 
 load_dotenv()
 st.set_page_config(page_title='Bharat Market AI Production',page_icon='📈',layout='wide')
-DB=os.getenv('APP_DB_PATH','stock_ai.db'); AN=SentimentIntensityAnalyzer()
+def config_value(name,default=''):
+ value=os.getenv(name)
+ if value not in (None,''):return value
+ try:
+  value=st.secrets.get(name,default)
+ except Exception:
+  return default
+ return value if value not in (None,'') else default
+DB=config_value('APP_DB_PATH','stock_ai.db'); AN=SentimentIntensityAnalyzer()
 H={'1 Day':1,'3 Days':3,'7 Days':7,'15 Days':15,'30 Days':30,'3 Months':63,'1 Year':252}
 
 def conn():
@@ -194,7 +202,7 @@ try:
   market=hist(instrument['benchmark'],period);sector=hist('USDINR=X',period)
  else:
   market=hist('^NSEI',period);sector=market.copy()
- reddit_id=os.getenv('REDDIT_CLIENT_ID','');reddit_secret=os.getenv('REDDIT_CLIENT_SECRET','');reddit_agent=os.getenv('REDDIT_USER_AGENT','indian-stock-ai/1.0');alpha_key=os.getenv('ALPHAVANTAGE_API_KEY','');marketaux_token=os.getenv('MARKETAUX_API_TOKEN','');finnhub_key=os.getenv('FINNHUB_API_KEY','');articles,provider_status=news(company,symbol,alpha_key,marketaux_token,finnhub_key,reddit_id,reddit_secret,reddit_agent,is_commodity);reconcile(symbol,raw);nscore=np.average([a['score'] for a in articles],weights=[a.get('relevance',1) for a in articles]) if articles else 0;mret=market.Close.pct_change().iloc[-1];sret=sector.Close.pct_change().iloc[-1];condition='Bullish' if mret>.003 else 'Bearish' if mret<-.003 else 'Neutral'
+ reddit_id=config_value('REDDIT_CLIENT_ID');reddit_secret=config_value('REDDIT_CLIENT_SECRET');reddit_agent=config_value('REDDIT_USER_AGENT','indian-stock-ai/1.0');alpha_key=config_value('ALPHAVANTAGE_API_KEY');marketaux_token=config_value('MARKETAUX_API_TOKEN');finnhub_key=config_value('FINNHUB_API_KEY');articles,provider_status=news(company,symbol,alpha_key,marketaux_token,finnhub_key,reddit_id,reddit_secret,reddit_agent,is_commodity);reconcile(symbol,raw);nscore=np.average([a['score'] for a in articles],weights=[a.get('relevance',1) for a in articles]) if articles else 0;mret=market.Close.pct_change().iloc[-1];sret=sector.Close.pct_change().iloc[-1];condition='Bullish' if mret>.003 else 'Bearish' if mret<-.003 else 'Neutral'
 except Exception as e:st.error(str(e));st.stop()
 tabs=st.tabs(['Prediction','Accuracy & Learning','News','Technical','Data Center','Operations'])
 with tabs[0]:
@@ -243,9 +251,9 @@ with tabs[1]:
  else:st.info('Run predictions. The app evaluates each one after its target date becomes available.')
 with tabs[2]:
  if st.button('Refresh news providers now'):
-  load_dotenv(override=True);alpha_key=os.getenv('ALPHAVANTAGE_API_KEY','');marketaux_token=os.getenv('MARKETAUX_API_TOKEN','');finnhub_key=os.getenv('FINNHUB_API_KEY','');reddit_id=os.getenv('REDDIT_CLIENT_ID','');reddit_secret=os.getenv('REDDIT_CLIENT_SECRET','');reddit_agent=os.getenv('REDDIT_USER_AGENT','indian-stock-ai/1.0');news.clear();articles,provider_status=news(company,symbol,alpha_key,marketaux_token,finnhub_key,reddit_id,reddit_secret,reddit_agent,is_commodity);nscore=np.average([a['score'] for a in articles],weights=[a.get('relevance',1) for a in articles]) if articles else 0
+  alpha_key=config_value('ALPHAVANTAGE_API_KEY');marketaux_token=config_value('MARKETAUX_API_TOKEN');finnhub_key=config_value('FINNHUB_API_KEY');reddit_id=config_value('REDDIT_CLIENT_ID');reddit_secret=config_value('REDDIT_CLIENT_SECRET');reddit_agent=config_value('REDDIT_USER_AGENT','indian-stock-ai/1.0');news.clear();articles,provider_status=news(company,symbol,alpha_key,marketaux_token,finnhub_key,reddit_id,reddit_secret,reddit_agent,is_commodity);nscore=np.average([a['score'] for a in articles],weights=[a.get('relevance',1) for a in articles]) if articles else 0
  with st.expander('Alpha Vantage free daily price-data check'):
-  load_dotenv();alpha_key=os.getenv('ALPHAVANTAGE_API_KEY','')
+  alpha_key=config_value('ALPHAVANTAGE_API_KEY')
   suggested_av_symbol=symbol.rsplit('.',1)[0]+'.BSE'
   av_symbol=st.text_input('Alpha Vantage symbol (editable)',value=suggested_av_symbol,help='Alpha Vantage documents BSE symbols such as RELIANCE.BSE. Verify the provider symbol for the selected company.')
   st.caption('This makes a TIME_SERIES_DAILY request with outputsize=compact (up to 100 OHLCV rows). The daily price endpoint is free-key compatible; NEWS_SENTIMENT remains premium. Data is raw/as-traded and is displayed separately, not merged into the auto-adjusted Yahoo model history.')

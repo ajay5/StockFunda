@@ -3,6 +3,8 @@ services:
     build: .
     ports: ["8501:8501"]
     env_file: .env
+    environment:
+      APP_DB_PATH: /app/data/stock_ai.db
     volumes: ["appdata:/app/data"]
 volumes:
   appdata:
