@@ -1,10 +1,10 @@
 import os,json,sqlite3,urllib.parse
-from datetime import datetime,timezone
+from datetime import datetime,timedelta,timezone
 import numpy as np,pandas as pd,streamlit as st,plotly.graph_objects as go,yfinance as yf,feedparser
 import requests
 from dotenv import load_dotenv
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-from market_data import fetch_bluesky_posts,fetch_gdelt_news,fetch_reddit_posts,normalize_yahoo_news,point_in_time_news_feature
+from market_data import fetch_alphavantage_daily,fetch_bluesky_posts,fetch_finnhub_general_news,fetch_finnhub_news,fetch_gdelt_news,fetch_marketaux_news,fetch_nse_announcements_rss,fetch_nse_company_announcements,fetch_reddit_posts,normalize_yahoo_news,point_in_time_news_feature
 from sklearn.ensemble import RandomForestRegressor,RandomForestClassifier,HistGradientBoostingRegressor
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import balanced_accuracy_score,mean_absolute_error,precision_score,brier_score_loss
@@ -42,6 +42,9 @@ def hist(ticker,period='5y'):
  if isinstance(d.columns,pd.MultiIndex):d.columns=d.columns.get_level_values(0)
  if d.empty:raise ValueError('No data for '+ticker)
  return d.dropna()
+@st.cache_data(ttl=6*3600,show_spinner=False)
+def alphavantage_daily_cached(api_key,symbol):
+ return fetch_alphavantage_daily(api_key,symbol)
 def indicators(d):
  x=d.copy();c=x.Close;v=x.Volume;delta=c.diff();up=delta.clip(lower=0);dn=-delta.clip(upper=0);rs=up.ewm(alpha=1/14,adjust=False).mean()/dn.ewm(alpha=1/14,adjust=False).mean().replace(0,np.nan)
  x['RSI']=100-100/(1+rs);x['EMA20']=c.ewm(span=20).mean();x['EMA50']=c.ewm(span=50).mean();x['EMA200']=c.ewm(span=200).mean();x['MACD']=c.ewm(span=12).mean()-c.ewm(span=26).mean();x['MACDS']=x.MACD.ewm(span=9).mean();x['RET']=c.pct_change();x['VOL']=x.RET.rolling(20).std()*np.sqrt(252);x['VOLZ']=(v-v.rolling(20).mean())/v.rolling(20).std();x['ATR']=pd.concat([x.High-x.Low,(x.High-c.shift()).abs(),(x.Low-c.shift()).abs()],axis=1).max(axis=1).rolling(14).mean();return x
@@ -52,12 +55,30 @@ def reddit_access_token(client_id,client_secret,user_agent):
   response=requests.post('https://www.reddit.com/api/v1/access_token',auth=(client_id,client_secret),data={'grant_type':'client_credentials'},headers={'User-Agent':user_agent},timeout=(3,8));response.raise_for_status();return str(response.json().get('access_token') or '')
  except (requests.RequestException,ValueError):return ''
 @st.cache_data(ttl=300,show_spinner=False)
-def news(company,symbol):
- out=[]
+def news(company,symbol,alpha_key,marketaux_token,finnhub_key,reddit_id,reddit_secret,reddit_agent):
+ out=[];provider_status=[]
+ def collect_api(name,key,environment_name,fetch):
+  checked_at=datetime.now(timezone.utc).isoformat()
+  if not key:
+   provider_status.append({'Provider':name,'Configured':'No','Called':'No','Articles':0,'Status':'Not configured','Details':f'Set {environment_name} in .env','Checked UTC':checked_at})
+   return
+  try:
+   items,detail=fetch();items=items or [];out.extend(items)
+   provider_status.append({'Provider':name,'Configured':'Yes','Called':'Yes','Articles':len(items),'Status':'OK' if items else ('No results' if detail.startswith('Request succeeded') else 'Error'),'Details':detail,'Checked UTC':checked_at})
+  except Exception as exc:
+   provider_status.append({'Provider':name,'Configured':'Yes','Called':'Yes','Articles':0,'Status':'Error','Details':f'Unexpected {type(exc).__name__}','Checked UTC':checked_at})
  try:
   out.extend(normalize_yahoo_news(yf.Ticker(symbol).get_news(count=30)))
  except Exception:
   pass
+ provider_status.append({'Provider':'Alpha Vantage NEWS_SENTIMENT','Configured':'Yes' if alpha_key else 'No','Called':'No','Articles':0,'Status':'Not available on free plan' if alpha_key else 'Not configured','Details':'Alpha Vantage marks NEWS_SENTIMENT as premium; skipped to avoid a guaranteed premium-plan error.' if alpha_key else 'Set ALPHAVANTAGE_API_KEY in .env if you later enable a plan with NEWS_SENTIMENT access.','Checked UTC':datetime.now(timezone.utc).isoformat()})
+ nse_end=datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=5,minutes=30))).date()
+ nse_start=nse_end-timedelta(days=365)
+ collect_api('NSE India official announcements RSS','public','NSE official RSS',lambda:fetch_nse_announcements_rss(symbol,company,30))
+ collect_api('NSE India company announcement archive','public','NSE official announcements',lambda:fetch_nse_company_announcements(symbol,nse_start,nse_end,limit=500))
+ collect_api('Marketaux',marketaux_token,'MARKETAUX_API_TOKEN',lambda:fetch_marketaux_news(marketaux_token,symbol,20))
+ collect_api('Finnhub company news (free tier)',finnhub_key,'FINNHUB_API_KEY',lambda:fetch_finnhub_news(finnhub_key,symbol,20))
+ collect_api('Finnhub general market news (free)',finnhub_key,'FINNHUB_API_KEY',lambda:fetch_finnhub_general_news(finnhub_key,20))
  url='https://news.google.com/rss/search?q='+urllib.parse.quote(company+' stock India')+'&hl=en-IN&gl=IN&ceid=IN:en'
  try:
   response=requests.get(url,timeout=(3,8));response.raise_for_status();feed=feedparser.parse(response.content)
@@ -73,7 +94,6 @@ def news(company,symbol):
  except Exception:pass
  try:out.extend(fetch_bluesky_posts(f'{company} stock',limit=20))
  except Exception:pass
- reddit_id=os.getenv('REDDIT_CLIENT_ID','');reddit_secret=os.getenv('REDDIT_CLIENT_SECRET','');reddit_agent=os.getenv('REDDIT_USER_AGENT','indian-stock-ai/1.0')
  if reddit_id and reddit_secret:
   token=reddit_access_token(reddit_id,reddit_secret,reddit_agent)
   try:out.extend(fetch_reddit_posts(f'"{company}" OR "{bare_symbol}"',token,reddit_agent,limit=20))
@@ -82,9 +102,12 @@ def news(company,symbol):
  for item in out:
   title=item.get('title','').strip();key=title.casefold()
   if not title or key in seen:continue
-  seen.add(key);score=AN.polarity_scores(item.get('sentiment_text',title))['compound'];item['score']=score;articles.append(item)
-  c.execute('INSERT OR IGNORE INTO news_history(symbol,captured_at,published_at,source,headline,url,sentiment,relevance) VALUES(?,?,?,?,?,?,?,?)',(symbol,now,item.get('published',''),item.get('source','Financial News'),title,item.get('url',''),score,float(item.get('relevance',1))))
- c.commit();c.close();return articles
+  seen.add(key)
+  try:score=float(item['sentiment']) if item.get('sentiment') is not None else AN.polarity_scores(item.get('sentiment_text',title))['compound']
+  except (TypeError,ValueError):score=AN.polarity_scores(item.get('sentiment_text',title))['compound']
+  item['score']=float(np.clip(score,-1,1));articles.append(item)
+  c.execute('INSERT OR IGNORE INTO news_history(symbol,captured_at,published_at,source,headline,url,sentiment,relevance) VALUES(?,?,?,?,?,?,?,?)',(symbol,now,item.get('published',''),item.get('source','Financial News'),title,item.get('url',''),item['score'],float(item.get('relevance',1))))
+ c.commit();c.close();return articles,provider_status
 def sector_proxy(sec,suffix,period):
  frames=[]
  for t in SECTORS[sec].values():
@@ -99,11 +122,24 @@ def reconcile(symbol,d):
   td=future[r['horizon']-1];actual=closes[td];ar=actual/r['latest_close']-1;pdirection=np.sign(r['predicted_return']);adirection=np.sign(ar)
   c.execute('UPDATE predictions SET target_date=?,actual_close=?,actual_return=?,percentage_error=?,direction_correct=?,evaluated_at=? WHERE id=?',(td,actual,ar,abs(actual-r['predicted_close'])/actual*100,int(pdirection==adirection),datetime.now(timezone.utc).isoformat(),r['id']))
  c.commit();c.close()
-def model(stock,market,sector,symbol,horizon,current_news,cost):
+def model(stock,market,sector,symbol,horizon,cost):
  x=stock.copy();m=market.Close.reindex(x.index).ffill();s=sector.Close.reindex(x.index).ffill();x['MKT']=m.pct_change();x['SEC']=s.pct_change();x['RELM']=x.RET-x.MKT;x['RELS']=x.RET-x.SEC
  x['RET5']=x.Close.pct_change(5);x['RET20']=x.Close.pct_change(20);x['MKT5']=m.pct_change(5);x['MKT20']=m.pct_change(20);x['MKT_VOL20']=x.MKT.rolling(20).std()*np.sqrt(252);x['SEC5']=s.pct_change(5);x['SEC20']=s.pct_change(20);x['SEC_VOL20']=x.SEC.rolling(20).std()*np.sqrt(252)
- c=conn();rows=c.execute('SELECT published_at,sentiment,relevance FROM news_history WHERE symbol=? AND published_at IS NOT NULL',(symbol,)).fetchall();c.close();x['NEWS']=point_in_time_news_feature(x.index,[dict(r) for r in rows]).to_numpy();x['Y']=x.Close.shift(-horizon)/x.Close-1;band=np.maximum(.004,x.RET.rolling(60).std()*np.sqrt(horizon)*.35);x['C']=np.select([x.Y>band,x.Y<-band],[2,0],default=1)
- F=['RSI','EMA20','EMA50','EMA200','MACD','MACDS','RET','RET5','RET20','VOL','VOLZ','ATR','MKT','MKT5','MKT20','MKT_VOL20','SEC','SEC5','SEC20','SEC_VOL20','RELM','RELS','NEWS'];z=x[F+['Y','C']].replace([np.inf,-np.inf],np.nan).dropna().iloc[:-horizon]
+ c=conn();rows=[dict(r) for r in c.execute('SELECT published_at,sentiment,relevance,source FROM news_history WHERE symbol=? AND published_at IS NOT NULL',(symbol,)).fetchall()];c.close()
+ announcement_rows=[];social_rows=[];news_rows=[]
+ for row in rows:
+  source=str(row.get('source','')).casefold()
+  if source.startswith('nse india'):
+   announcement_rows.append(row)
+  elif source.startswith(('reddit','bluesky')):
+   social_rows.append(row)
+  else:
+   news_rows.append(row)
+ x['ANNOUNCEMENTS_365D']=point_in_time_news_feature(x.index,announcement_rows,lookback_days=365).to_numpy()
+ x['NEWS_SENTIMENT_90D']=point_in_time_news_feature(x.index,news_rows,lookback_days=90).to_numpy()
+ x['SOCIAL_SENTIMENT_30D']=point_in_time_news_feature(x.index,social_rows,lookback_days=30).to_numpy()
+ x['Y']=x.Close.shift(-horizon)/x.Close-1;band=np.maximum(.004,x.RET.rolling(60).std()*np.sqrt(horizon)*.35);x['C']=np.select([x.Y>band,x.Y<-band],[2,0],default=1)
+ F=['RSI','EMA20','EMA50','EMA200','MACD','MACDS','RET','RET5','RET20','VOL','VOLZ','ATR','MKT','MKT5','MKT20','MKT_VOL20','SEC','SEC5','SEC20','SEC_VOL20','RELM','RELS','ANNOUNCEMENTS_365D','NEWS_SENTIMENT_90D','SOCIAL_SENTIMENT_30D'];z=x[F+['Y','C']].replace([np.inf,-np.inf],np.nan).dropna().iloc[:-horizon]
  if len(z)<260:raise ValueError('Choose 5y or 10y history; insufficient valid rows.')
  X,yr,yc=z[F],z.Y,z.C.astype(int);cv=TimeSeriesSplit(n_splits=5,gap=horizon);op=np.full(len(z),np.nan);oq=np.full((len(z),3),np.nan)
  for tr,te in cv.split(X):
@@ -112,23 +148,23 @@ def model(stock,market,sector,symbol,horizon,current_news,cost):
  valid=~np.isnan(op);act=yr.to_numpy()[valid];pred=op[valid];classes=yc.to_numpy()[valid];probs=oq[valid];cal=LogisticRegression(max_iter=1000).fit(probs,classes);cp=cal.predict_proba(probs);pc=cp.argmax(1)
  metrics={'balanced_accuracy':balanced_accuracy_score(classes,pc)*100,'baseline_accuracy':balanced_accuracy_score(classes,np.ones_like(classes))*100,'mae':mean_absolute_error(act,pred)*100,'naive_mae':mean_absolute_error(act,np.zeros_like(act))*100,'buy_precision':precision_score(classes,pc,labels=[2],average='micro',zero_division=0)*100,'sell_precision':precision_score(classes,pc,labels=[0],average='micro',zero_division=0)*100,'brier':np.mean([brier_score_loss((classes==k).astype(int),cp[:,k]) for k in range(3)])}
  strategy=np.where(pc==2,act-cost/10000,np.where(pc==0,-act-cost/10000,0));metrics['cost_return']=(np.prod(1+strategy)-1)*100
- r1=RandomForestRegressor(n_estimators=400,max_depth=8,min_samples_leaf=5,n_jobs=-1,random_state=42).fit(X,yr);r2=HistGradientBoostingRegressor(max_iter=220,max_depth=5,random_state=42).fit(X,yr);cl=RandomForestClassifier(n_estimators=400,max_depth=8,min_samples_leaf=5,class_weight='balanced',n_jobs=-1,random_state=42).fit(X,yc);latest=x[F].dropna().iloc[[-1]].copy();latest['NEWS']=current_news;pr=float((r1.predict(latest)[0]+r2.predict(latest)[0])/2);raw=np.zeros((1,3));q=cl.predict_proba(latest)[0]
+ r1=RandomForestRegressor(n_estimators=400,max_depth=8,min_samples_leaf=5,n_jobs=-1,random_state=42).fit(X,yr);r2=HistGradientBoostingRegressor(max_iter=220,max_depth=5,random_state=42).fit(X,yr);cl=RandomForestClassifier(n_estimators=400,max_depth=8,min_samples_leaf=5,class_weight='balanced',n_jobs=-1,random_state=42).fit(X,yc);latest=x[F].dropna().iloc[[-1]].copy();pr=float((r1.predict(latest)[0]+r2.predict(latest)[0])/2);raw=np.zeros((1,3));q=cl.predict_proba(latest)[0]
  for k,v in zip(cl.classes_,q):raw[0,int(k)]=v
  pp=cal.predict_proba(raw)[0];res=act-pred;lo,hi=np.quantile(res,[.1,.9]);close=float(stock.Close.iloc[-1]);version=f'{symbol}-h{horizon}-{stock.index[-1].date()}'
  return {'return':pr,'price':close*(1+pr),'low':close*(1+pr+lo),'high':close*(1+pr+hi),'signal':['SELL','HOLD','BUY'][pp.argmax()],'confidence':pp.max()*100,'bull':pp[2]*100,'bear':pp[0]*100,'metrics':metrics,'version':version,'features':latest.iloc[0].to_dict()}
 
 st.title('📈 Bharat Market AI Production Research Platform');st.error('No model can guarantee returns. Use this only for research and paper trading, not as investment advice.')
 with st.sidebar:
- exchange=st.selectbox('Exchange',['NSE','BSE']);suffix='.NS' if exchange=='NSE' else '.BO';sec=st.selectbox('Sector',list(SECTORS));company=st.selectbox('Company',list(SECTORS[sec]));symbol=SECTORS[sec][company]+suffix;hn=st.selectbox('Horizon',list(H));horizon=H[hn];period=st.selectbox('History',['2y','5y','10y'],index=1);cost=st.number_input('Round-trip cost (bps)',0,200,20,5);run=st.button('Train, evaluate & predict',type='primary',use_container_width=True)
+  exchange=st.selectbox('Exchange',['NSE','BSE']);suffix='.NS' if exchange=='NSE' else '.BO';sec=st.selectbox('Sector',list(SECTORS));company=st.selectbox('Company',list(SECTORS[sec]));symbol=SECTORS[sec][company]+suffix;hn=st.selectbox('Horizon',list(H));horizon=H[hn];period=st.selectbox('Price history for model',['5y','10y'],index=0);cost=st.number_input('Round-trip cost (bps)',0,200,20,5);run=st.button('Train, evaluate & predict',type='primary',use_container_width=True)
 try:
- raw=hist(symbol,period);stock=indicators(raw);market=hist('^NSEI',period);sector=sector_proxy(sec,suffix,period);articles=news(company,symbol);reconcile(symbol,raw);nscore=np.average([a['score'] for a in articles],weights=[a.get('relevance',1) for a in articles]) if articles else 0;mret=market.Close.pct_change().iloc[-1];sret=sector.Close.pct_change().iloc[-1];condition='Bullish' if mret>.003 else 'Bearish' if mret<-.003 else 'Neutral'
+ raw=hist(symbol,period);stock=indicators(raw);market=hist('^NSEI',period);sector=sector_proxy(sec,suffix,period);reddit_id=os.getenv('REDDIT_CLIENT_ID','');reddit_secret=os.getenv('REDDIT_CLIENT_SECRET','');reddit_agent=os.getenv('REDDIT_USER_AGENT','indian-stock-ai/1.0');alpha_key=os.getenv('ALPHAVANTAGE_API_KEY','');marketaux_token=os.getenv('MARKETAUX_API_TOKEN','');finnhub_key=os.getenv('FINNHUB_API_KEY','');articles,provider_status=news(company,symbol,alpha_key,marketaux_token,finnhub_key,reddit_id,reddit_secret,reddit_agent);reconcile(symbol,raw);nscore=np.average([a['score'] for a in articles],weights=[a.get('relevance',1) for a in articles]) if articles else 0;mret=market.Close.pct_change().iloc[-1];sret=sector.Close.pct_change().iloc[-1];condition='Bullish' if mret>.003 else 'Bearish' if mret<-.003 else 'Neutral'
 except Exception as e:st.error(str(e));st.stop()
 tabs=st.tabs(['Prediction','Accuracy & Learning','News','Technical','Data Center','Operations'])
 with tabs[0]:
  fig=go.Figure([go.Candlestick(x=stock.index,open=stock.Open,high=stock.High,low=stock.Low,close=stock.Close),go.Scatter(x=stock.index,y=stock.EMA20,name='EMA20'),go.Scatter(x=stock.index,y=stock.EMA50,name='EMA50')]);fig.update_layout(height=430,xaxis_rangeslider_visible=False);st.plotly_chart(fig,use_container_width=True)
  if run:
   try:
-   r=model(stock,market,sector,symbol,horizon,nscore,cost);close=float(stock.Close.iloc[-1]);cols=st.columns(7);vals=[('Signal',r['signal']),('Confidence',f"{r['confidence']:.1f}%"),('Latest',f'₹{close:,.2f}'),('Forecast',f"₹{r['price']:,.2f}"),('Return',f"{r['return']*100:+.2f}%"),('Bullish',f"{r['bull']:.1f}%"),('Bearish',f"{r['bear']:.1f}%")]
+   r=model(stock,market,sector,symbol,horizon,cost);close=float(stock.Close.iloc[-1]);cols=st.columns(7);vals=[('Signal',r['signal']),('Confidence',f"{r['confidence']:.1f}%"),('Latest',f'₹{close:,.2f}'),('Forecast',f"₹{r['price']:,.2f}"),('Return',f"{r['return']*100:+.2f}%"),('Bullish',f"{r['bull']:.1f}%"),('Bearish',f"{r['bear']:.1f}%")]
    for c,(k,v) in zip(cols,vals):c.metric(k,v)
    st.write(f"80% empirical interval: **₹{r['low']:,.2f} to ₹{r['high']:,.2f}**")
    c=conn();c.execute('INSERT OR REPLACE INTO predictions(symbol,prediction_date,horizon,latest_close,predicted_close,predicted_return,signal,confidence,bullish,bearish,low,high,market_condition,market_return,sector_return,news_score,news_json,feature_json,model_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(symbol,stock.index[-1].date().isoformat(),horizon,close,r['price'],r['return'],r['signal'],r['confidence'],r['bull'],r['bear'],r['low'],r['high'],condition,mret,sret,nscore,json.dumps(articles),json.dumps(r['features']),r['version']));c.execute('INSERT INTO model_registry(symbol,horizon,version,trained_at,rows,metrics_json,active) VALUES(?,?,?,?,?,?,1)',(symbol,horizon,r['version'],datetime.now(timezone.utc).isoformat(),len(stock),json.dumps(r['metrics'])));c.commit();c.close()
@@ -144,13 +180,62 @@ with tabs[1]:
   if len(done):a=st.columns(4);a[0].metric('Live predictions',len(done));a[1].metric('Direction accuracy',f"{done.direction_correct.mean()*100:.1f}%");a[2].metric('Live MAE',f"{done.percentage_error.mean():.2f}%");a[3].metric('Versions',done.model_version.nunique())
  else:st.info('Run predictions. The app evaluates each one after its target date becomes available.')
 with tabs[2]:
+ if st.button('Refresh news providers now'):
+  load_dotenv(override=True);alpha_key=os.getenv('ALPHAVANTAGE_API_KEY','');marketaux_token=os.getenv('MARKETAUX_API_TOKEN','');finnhub_key=os.getenv('FINNHUB_API_KEY','');reddit_id=os.getenv('REDDIT_CLIENT_ID','');reddit_secret=os.getenv('REDDIT_CLIENT_SECRET','');reddit_agent=os.getenv('REDDIT_USER_AGENT','indian-stock-ai/1.0');news.clear();articles,provider_status=news(company,symbol,alpha_key,marketaux_token,finnhub_key,reddit_id,reddit_secret,reddit_agent);nscore=np.average([a['score'] for a in articles],weights=[a.get('relevance',1) for a in articles]) if articles else 0
+ with st.expander('Alpha Vantage free daily price-data check'):
+  load_dotenv();alpha_key=os.getenv('ALPHAVANTAGE_API_KEY','')
+  suggested_av_symbol=symbol.rsplit('.',1)[0]+'.BSE'
+  av_symbol=st.text_input('Alpha Vantage symbol (editable)',value=suggested_av_symbol,help='Alpha Vantage documents BSE symbols such as RELIANCE.BSE. Verify the provider symbol for the selected company.')
+  st.caption('This makes a TIME_SERIES_DAILY request with outputsize=compact (up to 100 OHLCV rows). The daily price endpoint is free-key compatible; NEWS_SENTIMENT remains premium. Data is raw/as-traded and is displayed separately, not merged into the auto-adjusted Yahoo model history.')
+  if st.button('Fetch Alpha Vantage daily prices',disabled=not bool(alpha_key)):
+   rows,detail=alphavantage_daily_cached(alpha_key,av_symbol.strip())
+   st.session_state['av_daily_result']={'symbol':av_symbol.strip(),'rows':rows,'detail':detail,'called':True}
+  daily_result=st.session_state.get('av_daily_result',{})
+  if daily_result.get('symbol')==av_symbol.strip():
+   st.caption(f"Endpoint status: {daily_result.get('detail','')} · Symbol: {av_symbol.strip()}")
+   if daily_result.get('rows'):
+    st.dataframe(pd.DataFrame(daily_result['rows']).set_index('Date'),use_container_width=True)
  st.metric('Current sentiment',f'{(nscore+1)*50:.1f}/100')
- st.caption('Feeds: Yahoo Finance, Google News RSS, GDELT, and public Bluesky search. Reddit search is enabled when Reddit API credentials are set in .env. Social posts are lower-weighted than news headlines.')
+ st.caption('Provider checks show whether your API keys were found, whether app.py called each endpoint, how many articles were returned, and provider response details. Alpha Vantage NEWS_SENTIMENT is skipped because it is premium-only; the free TIME_SERIES_DAILY compact endpoint is available in the price-data check above. Finnhub general market news uses its free /news?category=general endpoint; broad headlines receive lower model relevance than company-specific news. News status is cached for up to 5 minutes; click Refresh news providers now to force fresh requests. Alpha daily results are cached for 6 hours to protect the daily request quota.')
+ daily_result=st.session_state.get('av_daily_result',{})
+ daily_called=daily_result.get('symbol')==av_symbol.strip() and daily_result.get('called',False)
+ daily_rows=daily_result.get('rows',[]) if daily_called else []
+ daily_detail=daily_result.get('detail','Not called; use the manual check above.') if daily_called else ('Not configured' if not alpha_key else 'Not called; manual check above')
+ provider_status.append({'Provider':'Alpha Vantage TIME_SERIES_DAILY (free compact)','Configured':'Yes' if alpha_key else 'No','Called':'Yes' if daily_called else 'No','Articles':len(daily_rows),'Status':'OK' if daily_called and daily_rows else ('Error' if daily_called else ('Not configured' if not alpha_key else 'Not called')),'Details':daily_detail,'Checked UTC':datetime.now(timezone.utc).isoformat()})
+ st.dataframe(pd.DataFrame(provider_status),use_container_width=True,hide_index=True)
  for a in articles:st.markdown(f"[{'🟢' if a['score']>.05 else '🔴' if a['score']<-.05 else '🟡'} {a['title']}]({a['url']}) · {a['source']} · {a['score']:+.2f}")
 with tabs[3]:
  cols=st.columns(8)
  for c,k in zip(cols,['RSI','MACD','MACDS','EMA20','EMA50','EMA200','ATR','VOL']):c.metric(k,f"{stock[k].iloc[-1]:.2f}")
 with tabs[4]:
+ st.subheader('Backfill historical NSE company announcements')
+ today_ist=datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=5,minutes=30))).date()
+ nse_range=st.date_input('NSE announcement date range',value=(today_ist-timedelta(days=365),today_ist),key='nse_announcement_range_12m')
+ if len(nse_range)==2:
+  nse_start,nse_end=nse_range
+  if st.button('Fetch historical NSE announcements'):
+   nse_rows,nse_detail=fetch_nse_company_announcements(symbol,nse_start,nse_end,limit=500)
+   st.session_state['nse_history_result']={'symbol':symbol,'start':nse_start.isoformat(),'end':nse_end.isoformat(),'rows':nse_rows,'detail':nse_detail}
+  nse_result=st.session_state.get('nse_history_result',{})
+  nse_rows=[]
+  if (nse_result.get('symbol'),nse_result.get('start'),nse_result.get('end'))==(symbol,nse_start.isoformat(),nse_end.isoformat()):
+   st.caption(nse_result.get('detail',''))
+   nse_rows=nse_result.get('rows',[])
+  if nse_rows:
+   st.dataframe(pd.DataFrame(nse_rows)[['published','title','source','url']],use_container_width=True,hide_index=True)
+   if st.button('Save fetched NSE announcements to news history'):
+    c=conn();saved=0;captured=datetime.now(timezone.utc).isoformat()
+    for item in nse_rows:
+     published=item.get('published','');title=item.get('title','').strip()
+     if not published or not title:continue
+     score=AN.polarity_scores(item.get('sentiment_text',title))['compound']
+     saved+=c.execute('INSERT OR IGNORE INTO news_history(symbol,captured_at,published_at,source,headline,url,sentiment,relevance) VALUES(?,?,?,?,?,?,?,?)',(symbol,captured,published,item.get('source','NSE India'),title,item.get('url',''),score,float(item.get('relevance',1)))).rowcount
+    c.commit();c.close();st.success(f'Saved {saved} new NSE announcements; duplicates were skipped.')
+  elif nse_result:
+   st.info('No matching NSE announcements were returned for this stock and date range.')
+ else:
+  st.info('Choose a start and end date to backfill historical NSE announcements.')
+ st.caption('The model uses the selected 5-year price history by default, rolling 12-month NSE announcement sentiment, rolling 90-day non-social news sentiment, and rolling 30-day Reddit/Bluesky sentiment. NSE RSS only contains recent items; use the 12-month archive backfill and save the results to make that history available to training. A longer history or more sentiment inputs can help evaluation but do not guarantee better forecasts.')
  st.subheader('Upload point-in-time historical news');f=st.file_uploader('News CSV',type='csv')
  if f:
   d=pd.read_csv(f);req={'published_at','symbol','headline','source','sentiment'}
